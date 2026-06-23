@@ -96,6 +96,7 @@ use std::marker::PhantomData;
 use std::ops::{ControlFlow, Range};
 use std::sync::{Arc, LazyLock};
 
+use indexmap::map::Entry;
 use itertools::Itertools;
 use ruff_index::{Idx, IndexVec, newtype_index};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -6786,7 +6787,7 @@ impl PathAssignments {
             target: "ty_python_semantic::types::constraints::PathAssignment",
             before = %format_args!(
                 "[{}]",
-                self.assignments[..start].iter().map(|assignment| {
+                self.assignments[..start].iter().map(|(assignment, _)| {
                     assignment.display(db, builder)
                 }).format(", "),
             ),
@@ -6804,7 +6805,7 @@ impl PathAssignments {
                 target: "ty_python_semantic::types::constraints::PathAssignment",
                 new = %format_args!(
                     "[{}]",
-                    self.assignments[start..].iter().map(|assignment| {
+                    self.assignments[start..].iter().map(|(assignment, _)| {
                         assignment.display(db, builder)
                     }).format(", "),
                 ),
@@ -6828,7 +6829,9 @@ impl PathAssignments {
         result
     }
 
-    pub(crate) fn positive_constraints(&self) -> impl Iterator<Item = ConstraintId> + '_ {
+    pub(crate) fn positive_constraints(
+        &self,
+    ) -> impl Iterator<Item = (ConstraintId, ConstraintId)> + '_ {
         self.assignments
             .iter()
             .filter_map(|(assignment, (source_order, _))| match assignment {
@@ -6838,7 +6841,7 @@ impl PathAssignments {
     }
 
     fn assignment_holds(&self, assignment: ConstraintAssignment) -> bool {
-        self.assignments.contains(&assignment)
+        self.assignments.contains_key(&assignment)
     }
 
     fn contains_constraint(&self, constraint: ConstraintId) -> bool {
@@ -6934,7 +6937,7 @@ impl PathAssignments {
                 assignment = %assignment.display(db, builder),
                 facts = %format_args!(
                     "[{}]",
-                    self.assignments.iter().map(|assignment| {
+                    self.assignments.iter().map(|(assignment, _)| {
                         assignment.display(db, builder)
                     }).format(", "),
                 ),
