@@ -93,7 +93,7 @@ pub(crate) fn is_wrapped_in_markdown_code_span(text: &str) -> bool {
 /// InlineMarkupScanner::new("before `code` after")
 ///     => Text("before "), Code("code"), Text(" after")
 /// ```
-struct InlineMarkupScanner<'a> {
+pub(crate) struct InlineMarkupScanner<'a> {
     /// The scanner used to find complete code spans.
     scanner: BacktickScanner<'a>,
     /// The end of the last token returned to the caller.
@@ -106,7 +106,7 @@ impl<'a> InlineMarkupScanner<'a> {
     /// Creates a lossless iterator over plain text and complete backtick-delimited code spans.
     ///
     /// Escaped or unmatched backticks remain part of an [`InlineMarkupToken::Text`] token.
-    fn new(source: &'a str) -> Self {
+    pub(crate) fn new(source: &'a str) -> Self {
         Self {
             scanner: BacktickScanner::new(source),
             last_token_end: TextSize::ZERO,
@@ -177,7 +177,7 @@ impl<'a> Iterator for InlineMarkupScanner<'a> {
 ///
 /// Escaped and unmatched backticks remain text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InlineMarkupToken<'a> {
+pub(crate) enum InlineMarkupToken<'a> {
     /// Source text outside a complete, unescaped backtick span.
     Text(&'a str),
     /// A complete code span whose backtick delimiters have equal lengths.
