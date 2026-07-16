@@ -38,6 +38,17 @@ pub(super) fn is_dotted_identifier(name: &str) -> bool {
     !name.is_empty() && name.split('.').all(is_identifier)
 }
 
+/// Returns whether `name` is a valid reStructuredText role name.
+///
+/// For example, this accepts `py:class` and `external+python:py:class`, but rejects `foo..bar`
+/// and `foo-`.
+pub(in crate::docstring) fn is_rest_role_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .split(['-', '.', '_', '+', ':'])
+            .all(|part| !part.is_empty() && part.chars().all(char::is_alphanumeric))
+}
+
 /// Returns whether `line` starts with a `CommonMark` list-item marker.
 ///
 /// `CommonMark` limits ordered-list markers to nine digits to avoid integer
@@ -530,7 +541,7 @@ pub(super) fn indentation(line: &str) -> TextSize {
 #[cfg(test)]
 mod tests {
     use super::{
-        BacktickScanner, InlineMarkupScanner, InlineMarkupToken, TextSize,
+        BacktickScanner, InlineMarkupScanner, InlineMarkupToken, TextSize, is_rest_role_name,
         is_wrapped_in_markdown_code_span, split_once_at_top_level_colon,
         split_trailing_parenthetical,
     };
@@ -594,6 +605,19 @@ mod tests {
             ("value", false),
         ] {
             assert_eq!(is_wrapped_in_markdown_code_span(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn recognizes_rest_role_names() {
+        for (name, expected) in [
+            ("class", true),
+            ("py:class", true),
+            ("external+python:py:class", true),
+            ("étiquette", true),
+            ("foo..bar", false),
+        ] {
+            assert_eq!(is_rest_role_name(name), expected, "{name:?}");
         }
     }
 
