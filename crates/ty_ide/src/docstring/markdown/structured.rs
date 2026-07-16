@@ -7,7 +7,7 @@ use super::general;
 use crate::docstring::document::SectionKind;
 use crate::docstring::document::preformatted::MarkdownFence;
 use crate::docstring::document::syntax::{
-    InlineMarkupScanner, InlineMarkupToken, is_wrapped_in_markdown_code_span,
+    InlineMarkupScanner, InlineMarkupToken, is_rest_role_name, is_wrapped_in_markdown_code_span,
     starts_with_markdown_list_item,
 };
 
@@ -375,7 +375,9 @@ fn description_block_start(description: &str) -> Option<usize> {
 fn render_type_code_span_into(output: &mut String, ty: &str) {
     let normalized = normalize_type_for_code_span(ty);
 
-    if is_wrapped_in_markdown_code_span(&normalized) {
+    // Preserve existing code spans, except abbreviated Sphinx references such as
+    // "`~pkg.Model`", whose display label is "Model".
+    if !normalized.starts_with("`~") && is_wrapped_in_markdown_code_span(&normalized) {
         output.push_str(&normalized);
         return;
     }
@@ -384,24 +386,114 @@ fn render_type_code_span_into(output: &mut String, ty: &str) {
     render_code_span_into(output, normalized.as_ref());
 }
 
-/// Removes embedded backticks and punctuation escapes before wrapping a type in a code span.
+/// Removes markup before wrapping a type in a code span. For example:
 ///
-/// For example, ``"{None, `pkg.Type`}"`` becomes `"{None, pkg.Type}"`, and `"-\\|>"` becomes
-/// `"-|>"`.
+/// ```text
+/// str or :class:`~pkg.Widget` or `pkg.Other` -> str or Widget or pkg.Other
+/// -\|> -> -|>
+/// ```
 fn normalize_embedded_type_markup(ty: &str) -> Cow<'_, str> {
     if !ty.contains('`') && !ty.contains('\\') {
         return Cow::Borrowed(ty);
     }
 
     let mut normalized = String::with_capacity(ty.len());
-    for token in InlineMarkupScanner::new(ty) {
+    let mut tokens = InlineMarkupScanner::new(ty).peekable();
+    let mut is_python_role_target = false;
+    while let Some(token) = tokens.next() {
         match token {
-            InlineMarkupToken::Text(text) => push_unescaped(&mut normalized, text),
-            InlineMarkupToken::Code(span) => push_unescaped(&mut normalized, span.content()),
+            InlineMarkupToken::Text(text) => {
+                // "str or :class:`Widget`" -> "str or `Widget`".
+                let (text_without_role, python_role_target) =
+                    if matches!(tokens.peek(), Some(InlineMarkupToken::Code(_))) {
+                        strip_rest_role(text).map_or((text, false), |(prefix, role_name)| {
+                            (prefix, is_python_domain_role(role_name))
+                        })
+                    } else {
+                        (text, false)
+                    };
+                is_python_role_target = python_role_target;
+                push_unescaped(&mut normalized, text_without_role);
+            }
+            InlineMarkupToken::Code(span) => {
+                let markup = span.content();
+                // "`~pkg.Widget`" -> "Widget"; ":obj:`.lines.line`" -> "lines.line";
+                // "``literal`tick``" -> "literal`tick".
+                let display_text = if span.is_single() {
+                    interpreted_text_label(markup, is_python_role_target)
+                } else {
+                    markup
+                };
+                is_python_role_target = false;
+                push_unescaped(&mut normalized, display_text);
+            }
         }
     }
 
     Cow::Owned(normalized)
+}
+
+/// Returns `text` without a trailing reStructuredText role.
+///
+/// `"str or :class:"` becomes `("str or ", "class")`.
+fn strip_rest_role(text: &str) -> Option<(&str, &str)> {
+    let without_closing_colon = text.strip_suffix(':')?;
+
+    // "str or :py:class" -> prefix = "str or ", role_name = "py:class".
+    let prefix = without_closing_colon.trim_end_matches(|character: char| {
+        character.is_alphanumeric() || matches!(character, '-' | '.' | '_' | '+' | ':')
+    });
+    let role_name = without_closing_colon[prefix.len()..].strip_prefix(':')?;
+
+    is_rest_role_name(role_name).then_some((prefix, role_name))
+}
+
+/// Returns whether `name` is a Sphinx Python-domain cross-reference role.
+fn is_python_domain_role(name: &str) -> bool {
+    let mut components = name.rsplit(':');
+    let Some(role) = components.next() else {
+        return false;
+    };
+
+    matches!(components.next(), None | Some("py"))
+        && matches!(
+            role,
+            "attr"
+                | "class"
+                | "const"
+                | "data"
+                | "deco"
+                | "exc"
+                | "func"
+                | "meth"
+                | "mod"
+                | "obj"
+                | "type"
+        )
+}
+
+/// Returns the display label for reStructuredText interpreted text.
+///
+/// For example, `"~pkg.Widget"` becomes `"Widget"`; a Python role target like `".lines.line"`
+/// becomes `"lines.line"`.
+fn interpreted_text_label(text: &str, is_python_role_target: bool) -> &str {
+    let (abbreviated, target) = text
+        .strip_prefix('~')
+        .map_or((false, text), |target| (true, target));
+    let target = if is_python_role_target {
+        target.strip_prefix('.').unwrap_or(target)
+    } else {
+        target
+    };
+    if target.is_empty() {
+        return text;
+    }
+
+    if abbreviated {
+        target.rsplit_once('.').map_or(target, |(_, label)| label)
+    } else {
+        target
+    }
 }
 
 fn push_unescaped(output: &mut String, text: &str) {
@@ -665,6 +757,63 @@ mod tests {
 
         **arrowstyle**: `str (default='-|>')`<HB>
         Arrow style.
+        ");
+    }
+
+    #[test]
+    fn section_items_remove_rest_roles_from_types() {
+        let _snap = bind_markdown_snapshot_filters();
+        let section = section_block(vec![
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("colormap"),
+                Some(
+                    "str or :class:`~matplotlib.colors.Colormap` or :mod:`matplotlib.colors` or `~.pandas.Index`",
+                ),
+                "Color mapping.",
+            ),
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("model"),
+                Some("`~astropy.modeling.core.Model`"),
+                "Model.",
+            ),
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("extension"),
+                Some("`.py`"),
+                "File extension.",
+            ),
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("config"),
+                Some("str or `.env` or `.Figure` or `.lines.Line2D`"),
+                "Configuration source.",
+            ),
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("line"),
+                Some(":py:obj:`.lines.line`"),
+                "Line helper.",
+            ),
+        ]);
+
+        assert_snapshot!(render_markdown(&section), @"
+        ## Parameters
+        **colormap**: `str or Colormap or matplotlib.colors or Index`<HB>
+        Color mapping.
+
+        **model**: `Model`<HB>
+        Model.
+
+        **extension**: `.py`<HB>
+        File extension.
+
+        **config**: `str or .env or .Figure or .lines.Line2D`<HB>
+        Configuration source.
+
+        **line**: `lines.line`<HB>
+        Line helper.
         ");
     }
 
