@@ -3555,16 +3555,29 @@ fn is_possibly_constraint_set_assignable<'db>(db: &'db dyn Db, types: TypePair<'
         .query(|_builder, when| !when.is_never_satisfied(db))
 }
 
-/// The bounds and builder-independent decision metadata for one constraint path.
+/// Represents one path through a constraint set BDD, along with additional information needed to
+/// extract a solution from that path without exposing non-inferable typevars.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(crate) struct ConstraintPath<'db> {
     /// Accumulated bounds for both inferable and non-inferable typevars on this path.
     bounds: Box<[PathBound<'db>]>,
-    /// Explicit positive equalities that fix non-inferable typevars to concrete types.
+
+    /// Explicit assignments of a non-inferable typevar to a specific type.
+    ///
+    /// This is used to determine whether or not a non-inferable typevar should be included in the
+    /// solution for an inferable typevar. If we fix a non-inferable typevar `N` to a specific
+    /// type, then we should substitute that assignment to all occurrences of `N` in the solution
+    /// for this path. If we didn't, then we should keep `N` in the solution.
     fixed_noninferable_bindings: Box<[TypeVarSolution<'db>]>,
-    /// Whether a positive or negative decision has an inferable subject or bare bound.
+
+    /// Whether this path imposes any positive or negative constraint on any inferable typevar.
+    /// This distinguishes genuinely unconstrained paths from paths whose inferable variables are
+    /// restricted but have no positive solution bindings.
     has_inferable_decision: bool,
-    /// Whether any accumulated bounds belong to a non-inferable typevar.
+
+    /// Whether any accumulated bounds belong to a non-inferable typevar. This activates a
+    /// potential optimization: for paths containing only inferable bounds, we can skip
+    /// non-inferable validation and repeated inferability checks during solution extraction.
     has_noninferable_bounds: bool,
 }
 
@@ -3592,46 +3605,50 @@ impl<'db> PathBounds<'db> {
     ) -> Self {
         struct CollectedPath {
             constraints: Vec<(ConstraintId, usize)>,
-            negative_constraints: Vec<ConstraintId>,
+            has_inferable_decision: bool,
         }
 
-        #[derive(Default)]
-        struct CollectVisitor {
+        struct CollectVisitor<'db> {
             sorted_paths: Vec<CollectedPath>,
+            inferable: TypeVarSet<'db>,
         }
 
-        impl PathFold for CollectVisitor {
+        impl<'db> PathFold<'db> for CollectVisitor<'db> {
             type Result = ();
             type Break = Infallible;
 
-            fn satisfied<'db>(
+            fn satisfied(
                 &mut self,
-                _db: &'db dyn Db,
-                _builder: &ConstraintSetBuilder<'db>,
+                db: &'db dyn Db,
+                builder: &ConstraintSetBuilder<'db>,
                 path: &PathAssignments,
             ) -> ControlFlow<Self::Break, Self::Result> {
                 let mut constraints = Vec::new();
-                let mut negative_constraints = Vec::new();
+                let mut has_inferable_decision = false;
                 for (assignment, (source_order, _)) in &path.assignments {
-                    match assignment {
+                    let constraint = match assignment {
                         ConstraintAssignment::Positive(constraint) => {
                             constraints.push((*constraint, *source_order));
+                            *constraint
                         }
-                        ConstraintAssignment::Negative(constraint) => {
-                            negative_constraints.push(*constraint);
-                        }
-                        ConstraintAssignment::Unconstrained(_) => {}
-                    }
+                        ConstraintAssignment::Negative(constraint) => *constraint,
+                        ConstraintAssignment::Unconstrained(_) => continue,
+                    };
+                    has_inferable_decision =
+                        has_inferable_decision
+                            || builder.constraint_data(constraint).constrains_typevar_that(
+                                |typevar| typevar.is_inferable(db, self.inferable),
+                            );
                 }
                 constraints.sort_by_key(|(_, source_order)| *source_order);
                 self.sorted_paths.push(CollectedPath {
                     constraints,
-                    negative_constraints,
+                    has_inferable_decision,
                 });
                 ControlFlow::Continue(())
             }
 
-            fn unsatisfied<'db>(
+            fn unsatisfied(
                 &mut self,
                 _db: &'db dyn Db,
                 _builder: &ConstraintSetBuilder<'db>,
@@ -3640,7 +3657,7 @@ impl<'db> PathBounds<'db> {
                 ControlFlow::Continue(())
             }
 
-            fn impossible<'db>(
+            fn impossible(
                 &mut self,
                 _db: &'db dyn Db,
                 _builder: &ConstraintSetBuilder<'db>,
@@ -3649,7 +3666,7 @@ impl<'db> PathBounds<'db> {
                 ControlFlow::Continue(())
             }
 
-            fn combine<'db>(
+            fn combine(
                 &mut self,
                 _db: &'db dyn Db,
                 _builder: &ConstraintSetBuilder<'db>,
@@ -3679,7 +3696,10 @@ impl<'db> PathBounds<'db> {
         // come out of `PathAssignment`s with identical `source_order`s, but if they do, those
         // "tied" constraints will still be ordered in a stable way. So we need a stable sort to
         // retain that stable per-tie ordering.
-        let mut collect_visitor = CollectVisitor::default();
+        let mut collect_visitor = CollectVisitor {
+            sorted_paths: Vec::default(),
+            inferable,
+        };
         let mut path = interior.path_assignments(builder);
         let _ = path.visit(db, builder, node, &mut collect_visitor);
         collect_visitor.sorted_paths.sort_by(|path1, path2| {
@@ -3699,16 +3719,6 @@ impl<'db> PathBounds<'db> {
             FxIndexMap::default();
 
         for path in collect_visitor.sorted_paths {
-            let has_inferable_decision = path
-                .constraints
-                .iter()
-                .map(|(constraint, _)| *constraint)
-                .chain(path.negative_constraints.iter().copied())
-                .any(|constraint| {
-                    builder
-                        .constraint_data(constraint)
-                        .constrains_typevar_that(|typevar| typevar.is_inferable(db, inferable))
-                });
             let mut fixed_noninferable_bindings = Vec::new();
 
             mappings.clear();
@@ -3752,14 +3762,15 @@ impl<'db> PathBounds<'db> {
             let bounds = mappings
                 .drain(..)
                 .map(|(bound_typevar, bounds)| {
-                    has_noninferable_bounds |= !bound_typevar.is_inferable(db, inferable);
+                    has_noninferable_bounds =
+                        has_noninferable_bounds || !bound_typevar.is_inferable(db, inferable);
                     bounds.finish(db, bound_typevar)
                 })
                 .collect();
             result.push(ConstraintPath {
                 bounds,
                 fixed_noninferable_bindings: fixed_noninferable_bindings.into_boxed_slice(),
-                has_inferable_decision,
+                has_inferable_decision: path.has_inferable_decision,
                 has_noninferable_bounds,
             });
         }
@@ -3862,7 +3873,7 @@ impl<'db> PathBounds<'db> {
     /// Solves each path while keeping non-inferable typevars private to the solver.
     ///
     /// Non-inferable bounds are validated before caller-owned callback state can be changed. The
-    /// callback receives only inferable typevars and returns:
+    /// callback receives only inferable typevars and should return:
     /// - `Ok(Some(solution))` to add a solution for this typevar on this path
     /// - `Ok(None)` to leave this typevar unsolved on this path
     /// - `Err(())` to invalidate the entire path
@@ -3880,6 +3891,9 @@ impl<'db> PathBounds<'db> {
 
         let mut solutions = Vec::with_capacity(paths.len());
         'paths: for path in paths {
+            // If this path provides an lower or upper bound on any non-inferable typevars, we have
+            // to make sure those bounds are valid. We do that by "solving" the non-inferable
+            // typevar, and throwing away the result, other than to make sure that it succeeds.
             if path.has_noninferable_bounds
                 && path
                     .bounds
@@ -4398,7 +4412,7 @@ impl InteriorNode {
             should_remove: F,
         }
 
-        impl<F> PathVisitor for AbstractVisitor<F>
+        impl<'db, F> PathVisitor<'db> for AbstractVisitor<F>
         where
             F: FnMut(ConstraintId) -> bool,
         {
@@ -4406,7 +4420,7 @@ impl InteriorNode {
             type Interior = (Disposition, ConstraintId, usize);
             type Break = Infallible;
 
-            fn visit_satisfied<'db>(
+            fn visit_satisfied(
                 &mut self,
                 _db: &'db dyn Db,
                 _builder: &ConstraintSetBuilder<'db>,
@@ -4415,7 +4429,7 @@ impl InteriorNode {
                 ControlFlow::Continue(ALWAYS_TRUE)
             }
 
-            fn visit_unsatisfied<'db>(
+            fn visit_unsatisfied(
                 &mut self,
                 _db: &'db dyn Db,
                 _builder: &ConstraintSetBuilder<'db>,
@@ -4424,7 +4438,7 @@ impl InteriorNode {
                 ControlFlow::Continue(ALWAYS_FALSE)
             }
 
-            fn visit_impossible<'db>(
+            fn visit_impossible(
                 &mut self,
                 _db: &'db dyn Db,
                 _builder: &ConstraintSetBuilder<'db>,
@@ -4433,7 +4447,7 @@ impl InteriorNode {
                 ControlFlow::Continue(ALWAYS_FALSE)
             }
 
-            fn enter_interior<'db>(
+            fn enter_interior(
                 &mut self,
                 _db: &'db dyn Db,
                 builder: &ConstraintSetBuilder<'db>,
@@ -4448,7 +4462,7 @@ impl InteriorNode {
                 ControlFlow::Continue((disposition, interior.constraint, interior.source_order))
             }
 
-            fn visit_edge<'db>(
+            fn visit_edge(
                 &mut self,
                 _db: &'db dyn Db,
                 builder: &ConstraintSetBuilder<'db>,
@@ -4492,7 +4506,7 @@ impl InteriorNode {
                 }
             }
 
-            fn leave_interior<'db>(
+            fn leave_interior(
                 &mut self,
                 _db: &'db dyn Db,
                 builder: &ConstraintSetBuilder<'db>,
@@ -6467,7 +6481,7 @@ impl SequentMap {
 ///
 /// Throughout this process, if any of your methods return [`ControlFlow::Break`], we will abort
 /// the path walk and immediately return that value.
-trait PathVisitor {
+trait PathVisitor<'db> {
     type Result;
     type Interior;
     type Break;
@@ -6475,7 +6489,7 @@ trait PathVisitor {
     /// Called when we reach the end of a satisfied path. `path` will contain all of the
     /// assignments on this path. The `Result` value that you return will be propagated back up as
     /// we "unwind" this path.
-    fn visit_satisfied<'db>(
+    fn visit_satisfied(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6485,7 +6499,7 @@ trait PathVisitor {
     /// Called when we reach the end of an unsatisfied path. `path` will contain all of the
     /// assignments on this path. The `Result` value that you return will be propagated back up as
     /// we "unwind" this path.
-    fn visit_unsatisfied<'db>(
+    fn visit_unsatisfied(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6496,7 +6510,7 @@ trait PathVisitor {
     /// contradict each other, or because an edge is structurally absent (such as the uncertain
     /// edge when visiting a negated BDD). The `Result` value that you return will be propagated
     /// back up as we "unwind" this path.
-    fn visit_impossible<'db>(
+    fn visit_impossible(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6507,7 +6521,7 @@ trait PathVisitor {
     /// [`Interior`][Self::Interior] value that will be passed to the
     /// [`visit_edge`][Self::visit_edge] and [`leave_interior`][Self::leave_interior] methods
     /// when we call them for this node.
-    fn enter_interior<'db>(
+    fn enter_interior(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6517,7 +6531,7 @@ trait PathVisitor {
     /// Called once for each edge in the BDD. You are given the [`Result`][Self::Result] value
     /// of the subtree that the edge points to, as well as the origin and derived assignments that
     /// are added by the edge.
-    fn visit_edge<'db>(
+    fn visit_edge(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6529,7 +6543,7 @@ trait PathVisitor {
 
     /// Called on the way back up as we leave each interior node in the BDD. Combines the
     /// [`Result`][Self::Result] values for each of the interior node's subtrees.
-    fn leave_interior<'db>(
+    fn leave_interior(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6545,12 +6559,12 @@ trait PathVisitor {
 ///
 /// This is a simpler trait to implement when you don't need as much control over the path walk.
 /// Any type that implements this trait can also be used as a [`PathVisitor`].
-trait PathFold {
+trait PathFold<'db> {
     type Result;
     type Break;
 
     /// Returns the base case value that represents a satisfied path.
-    fn satisfied<'db>(
+    fn satisfied(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6558,7 +6572,7 @@ trait PathFold {
     ) -> ControlFlow<Self::Break, Self::Result>;
 
     /// Returns the base case value that represents an unsatisfied path.
-    fn unsatisfied<'db>(
+    fn unsatisfied(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6566,7 +6580,7 @@ trait PathFold {
     ) -> ControlFlow<Self::Break, Self::Result>;
 
     /// Returns the base case value that represents an impossible path.
-    fn impossible<'db>(
+    fn impossible(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6575,7 +6589,7 @@ trait PathFold {
 
     /// Combines the values for each subtree of an interior node, returning a value that represents
     /// the subtree rooted at that node.
-    fn combine<'db>(
+    fn combine(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6585,15 +6599,15 @@ trait PathFold {
     ) -> ControlFlow<Self::Break, Self::Result>;
 }
 
-impl<T> PathVisitor for T
+impl<'db, T> PathVisitor<'db> for T
 where
-    T: PathFold,
+    T: PathFold<'db>,
 {
-    type Result = <T as PathFold>::Result;
+    type Result = <T as PathFold<'db>>::Result;
     type Interior = ();
-    type Break = <T as PathFold>::Break;
+    type Break = <T as PathFold<'db>>::Break;
 
-    fn visit_satisfied<'db>(
+    fn visit_satisfied(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6602,7 +6616,7 @@ where
         PathFold::satisfied(self, db, builder, path)
     }
 
-    fn visit_unsatisfied<'db>(
+    fn visit_unsatisfied(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6611,7 +6625,7 @@ where
         PathFold::unsatisfied(self, db, builder, path)
     }
 
-    fn visit_impossible<'db>(
+    fn visit_impossible(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6620,7 +6634,7 @@ where
         PathFold::impossible(self, db, builder, path)
     }
 
-    fn enter_interior<'db>(
+    fn enter_interior(
         &mut self,
         _db: &'db dyn Db,
         _builder: &ConstraintSetBuilder<'db>,
@@ -6629,7 +6643,7 @@ where
         ControlFlow::Continue(())
     }
 
-    fn visit_edge<'db>(
+    fn visit_edge(
         &mut self,
         _db: &'db dyn Db,
         _builder: &ConstraintSetBuilder<'db>,
@@ -6641,7 +6655,7 @@ where
         ControlFlow::Continue(subtree)
     }
 
-    fn leave_interior<'db>(
+    fn leave_interior(
         &mut self,
         db: &'db dyn Db,
         builder: &ConstraintSetBuilder<'db>,
@@ -6659,11 +6673,11 @@ where
 /// unsatisfiable. A `Break` result indicates the opposite.
 struct IsNeverSatisfiedVisitor;
 
-impl PathFold for IsNeverSatisfiedVisitor {
+impl<'db> PathFold<'db> for IsNeverSatisfiedVisitor {
     type Result = ();
     type Break = ();
 
-    fn satisfied<'db>(
+    fn satisfied(
         &mut self,
         _db: &'db dyn Db,
         _builder: &ConstraintSetBuilder<'db>,
@@ -6672,7 +6686,7 @@ impl PathFold for IsNeverSatisfiedVisitor {
         ControlFlow::Break(())
     }
 
-    fn unsatisfied<'db>(
+    fn unsatisfied(
         &mut self,
         _db: &'db dyn Db,
         _builder: &ConstraintSetBuilder<'db>,
@@ -6681,7 +6695,7 @@ impl PathFold for IsNeverSatisfiedVisitor {
         ControlFlow::Continue(())
     }
 
-    fn impossible<'db>(
+    fn impossible(
         &mut self,
         _db: &'db dyn Db,
         _builder: &ConstraintSetBuilder<'db>,
@@ -6690,7 +6704,7 @@ impl PathFold for IsNeverSatisfiedVisitor {
         ControlFlow::Continue(())
     }
 
-    fn combine<'db>(
+    fn combine(
         &mut self,
         _db: &'db dyn Db,
         _builder: &ConstraintSetBuilder<'db>,
@@ -6834,7 +6848,7 @@ impl PathAssignments {
         visitor: &mut V,
     ) -> ControlFlow<V::Break, V::Result>
     where
-        V: PathVisitor,
+        V: PathVisitor<'db>,
     {
         self.visit_inner(db, builder, node, visitor, false)
     }
@@ -6848,7 +6862,7 @@ impl PathAssignments {
         visitor: &mut V,
     ) -> ControlFlow<V::Break, V::Result>
     where
-        V: PathVisitor,
+        V: PathVisitor<'db>,
     {
         self.visit_inner(db, builder, node, visitor, true)
     }
@@ -6862,7 +6876,7 @@ impl PathAssignments {
         negated: bool,
     ) -> ControlFlow<V::Break, V::Result>
     where
-        V: PathVisitor,
+        V: PathVisitor<'db>,
     {
         match node.node() {
             Node::AlwaysTrue if negated => visitor.visit_unsatisfied(db, builder, self),
@@ -9059,11 +9073,11 @@ mod tests {
         }
     }
 
-    impl PathFold for ReconstructPathFold {
+    impl<'db> PathFold<'db> for ReconstructPathFold {
         type Result = NodeId;
         type Break = PathFoldBreak;
 
-        fn satisfied<'db>(
+        fn satisfied(
             &mut self,
             _db: &'db dyn Db,
             builder: &ConstraintSetBuilder<'db>,
@@ -9081,7 +9095,7 @@ mod tests {
             self.result(PathFoldBreak::Satisfied, result)
         }
 
-        fn unsatisfied<'db>(
+        fn unsatisfied(
             &mut self,
             _db: &'db dyn Db,
             _builder: &ConstraintSetBuilder<'db>,
@@ -9090,7 +9104,7 @@ mod tests {
             self.result(PathFoldBreak::Unsatisfied, ALWAYS_FALSE)
         }
 
-        fn impossible<'db>(
+        fn impossible(
             &mut self,
             _db: &'db dyn Db,
             _builder: &ConstraintSetBuilder<'db>,
@@ -9099,7 +9113,7 @@ mod tests {
             self.result(PathFoldBreak::Impossible, ALWAYS_FALSE)
         }
 
-        fn combine<'db>(
+        fn combine(
             &mut self,
             _db: &'db dyn Db,
             builder: &ConstraintSetBuilder<'db>,
